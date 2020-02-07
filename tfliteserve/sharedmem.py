@@ -9,12 +9,31 @@ the shared buffers include:
         1 input ready [set by client]
         2 processing [set by server]
         3 output ready [set by server]
+
+Need separate codes per client, clients will need to have a unique channel.
+Channel negotiation is... complicated, skip it, just pre-assign.
+
+Each client should make it's own folder
+
+main_dir: /dev/shm/tfliteserver
+
+each client directory has:
+    - status
+    - input
+    - output
+    - meta: input/output details
+
+client connects:
+    - makes new folder in directory (if directory exists, delete it)
+    - server sees new folder, fills with meta data & buffers
+    - client connects to buffers
 """
 
 import base64
 import logging
 import os
 import pickle
+import shutil
 import time
 
 import numpy
@@ -22,17 +41,13 @@ import numpy
 from . import model
 
 
-# names of mmap files (/dev/shm is shared memory)
-default_folder = '/dev/shm/tfliteserver'
-in_array_fn = 'nn_input'
-out_array_fn = 'nn_output'
-status_fn = 'nn_status'
-meta_fn = 'meta'
+default_server_folder = '/dev/shm/tfliteserver'
 
 STATUS_IDLE = 0
 STATUS_INPUT_READY = 1
 STATUS_PROCESSING = 2
 STATUS_OUTPUT_READY = 3
+STATUS_CLIENT_PING = 10
 
 status_code_to_name = {
     STATUS_IDLE: 'idle',
@@ -59,15 +74,20 @@ class SharedMemoryBuffers:
 
     Parameters
     ---------
+    name: string
+        Buffer collection name (will be subdir in shared buffer server_folder).
     meta: dict or None
         Dictionary containing metadata about the shared buffers including:
             input: dict, see tensorflow flite interpreter input_details
             output: dict, see tensorflow flite interpreter output_details
             labels: dict, see model.load_labels
-        If None, meta will be read from the meta_fn file in the folder
-    folder: string or None
+        If None, meta will be read from the meta file in the folder
+    server_folder: string or None
         Folder path in which to store shared memory mapped files. If None
-        default_folder will be used.x
+        default_server_folder will be used.
+    create: bool, default=True
+        Create shared buffers otherwise remove folder and wait for another
+        process to create the buffers.
 
     Attributes
     ----------
@@ -103,19 +123,27 @@ class SharedMemoryBuffers:
     Examples
     --------
     """
-    def __init__(self, meta=None, folder=None):
-        if folder is None:
-            folder = default_folder
+    def __init__(self, name, meta=None, server_folder=None, create=True):
+        if server_folder is None:
+            server_folder = default_server_folder
+        folder = os.path.join(server_folder, name)
         self.folder = folder
-        if not os.path.exists(folder):
-            os.makedirs(folder)
+        if create:
+            if meta is None:
+                raise ValueError("meta is required if creating buffers")
+            self._create_buffers(meta)
+        else:
+            self._wait_for_buffers()
+
+    def _create_buffers(self, meta=None):
+        mfn = os.path.join(self.folder, 'meta')
         if meta is None:
             # load meta from directory
-            with open(os.path.join(folder, meta_fn), 'rb') as f:
+            with open(mfn, 'rb') as f:
                 meta = pickle.load(f)
         else:
             # write meta to directory
-            with open(os.path.join(folder, meta_fn), 'wb') as f:
+            with open(mfn, 'wb') as f:
                 pickle.dump(meta, f)
 
         if 'input' not in meta:
@@ -131,7 +159,7 @@ class SharedMemoryBuffers:
         input_dtype = numpy.dtype(meta['input']['dtype'])
 
         self.input_array = numpy.memmap(
-            os.path.join(folder, in_array_fn),
+            os.path.join(self.folder, 'input'),
             dtype=input_dtype, mode='w+', shape=input_shape)
 
         # if output is quantized, it's dtype won't match output_details
@@ -142,13 +170,25 @@ class SharedMemoryBuffers:
             output_dtype = numpy.dtype(meta['output']['dtype'])
 
         self.output_array = numpy.memmap(
-            os.path.join(folder, out_array_fn),
+            os.path.join(self.folder, 'output'),
             dtype=output_dtype, mode='w+', shape=output_shape)
         
         # status file/pipe?
         self.status_array = numpy.memmap(
-            os.path.join(folder, status_fn),
+            os.path.join(self.folder, 'status'),
             dtype=numpy.uint8, mode='w+', shape=(1, ))
+
+    def _wait_for_buffers(self):
+        # if folder exists, remove it
+        if os.path.exists(self.folder):
+            shutil.rmtree(self.folder)
+            while os.path.exists(self.folder):
+                time.sleep(0.001)
+        os.makedirs(self.folder)
+        sfn = os.path.join(self.folder, 'status')
+        while not os.path.exists(sfn):
+            time.sleep(0.001)
+        self._create_buffers()
 
     def set_input(self, values):
         """Copy values to input_array buffer and flush to disk
@@ -302,33 +342,56 @@ class SharedMemoryBuffers:
 
 
 class SharedMemoryServer:
-    def __init__(self, model, poll_delay=0.0001, folder=None):
+    def __init__(self, model, poll_delay=0.0001, server_folder=None):
         self.model = model
-        meta = {
+        if server_folder is None:
+            server_folder = default_server_folder
+        self.folder = server_folder
+        self.poll_delay = poll_delay
+        self.clients = {}
+        self.meta = {
             'input': model.input_details,
             'output': model.output_details,
             'labels': model.labels,
         }
-        self.buffers = SharedMemoryBuffers(meta, folder=None)
-        self.buffers.set_status(STATUS_IDLE)
-        self.poll_delay = poll_delay
 
-    def run(self):
-        self.buffers.set_status(STATUS_PROCESSING)
-        self.buffers.set_output(self.model.run(self.buffers.input_array))
-        self.buffers.set_status(STATUS_OUTPUT_READY)
+    def check_for_new_clients(self):
+        for cn in os.listdir(self.folder):
+            if cn not in self.clients:
+                self.add_client(cn)
+            else:
+                # check for status file
+                sfn = os.path.join(self.folder, cn, 'status')
+                if not os.path.exists(sfn):
+                    self.add_client(cn)
+
+    def add_client(self, name):
+        self.clients[name] = SharedMemoryBuffers(
+            name, self.meta, server_folder=self.folder, create=True)
+        self.clients[name].set_status(STATUS_IDLE)
+
+    def check_clients(self):
+        r = False
+        for cn in self.clients:
+            b = self.clients[cn]
+            if b.get_status() == STATUS_INPUT_READY:
+                b.set_status(STATUS_PROCESSING)
+                b.set_output(self.model.run(b.input_array))
+                b.set_status(STATUS_OUTPUT_READY)
+                r = True
 
     def run_forever(self):
         while True:
-            if self.buffers.get_status() == STATUS_INPUT_READY:
-                self.run()
-            else:
+            if not self.check_clients():
+                self.check_for_new_clients()  # TODO only do this periodically
                 time.sleep(self.poll_delay)
 
 
 class SharedMemoryClient:
-    def __init__(self, folder=None):
-        self.buffers = SharedMemoryBuffers(folder=folder)
+    def __init__(self, name, server_folder=None):
+        self.name = name
+        self.buffers = SharedMemoryBuffers(
+            name, server_folder=server_folder, create=False)
 
     def run(self, input_array, timeout=None, delay=None):
         if not self.buffers.wait_for_status(
