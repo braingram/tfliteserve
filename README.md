@@ -16,7 +16,7 @@ To use the server
 
 import tfliteserve.sharedmem
 
-c = tfliteserve.sharedmem.SharedMemoryClient()
+c = tfliteserve.sharedmem.SharedMemoryClient('unique_name')
 
 results = c.run(image)
 # where image is a correctly sized and typed numpy array
