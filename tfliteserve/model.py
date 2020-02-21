@@ -1,6 +1,9 @@
+import time
+
 import numpy
 
 import tflite_runtime.interpreter as tflite
+load_delegate = tflite.load_delegate
 
 
 EDGETPU_SHARED_LIB = 'libedgetpu.so.1'
@@ -34,7 +37,7 @@ class TFLiteModel:
         if edge:
             self.model = tflite.Interpreter(
                   model_path=model_fn,
-                  experimental_delegates=[tflite.load_delegate(EDGETPU_SHARED_LIB, {})])
+                  experimental_delegates=[load_delegate(EDGETPU_SHARED_LIB, {})])
         else:
             self.model = tflite.Interpreter(model_path=model_fn)
         self.model.allocate_tensors()
@@ -54,10 +57,12 @@ class TFLiteModel:
 
     def set_input(self, input_tensor):
         if input_tensor.dtype != self.input_details['dtype']:
+            print("Converting input dtype:", input_tensor.dtype, self.input_details['dtype'])
             input_tensor = input_tensor.astype(self.input_details['dtype'])
         if (
                 input_tensor.ndim != len(self.input_details['shape']) or
                 numpy.any(input_tensor.shape != self.input_details['shape'])):
+            print("Reshaping input:", input_tensor.shape, self.input_details['shape'])
             input_tensor = input_tensor.reshape(self.input_details['shape'])
         self.model.set_tensor(self.input_tensor_index, input_tensor)
 

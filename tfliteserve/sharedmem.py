@@ -142,6 +142,8 @@ class SharedMemoryBuffers:
             with open(mfn, 'rb') as f:
                 meta = pickle.load(f)
         else:
+            if not os.path.exists(self.folder):
+                os.makedirs(self.folder)
             # write meta to directory
             with open(mfn, 'wb') as f:
                 pickle.dump(meta, f)
@@ -177,6 +179,8 @@ class SharedMemoryBuffers:
         self.status_array = numpy.memmap(
             os.path.join(self.folder, 'status'),
             dtype=numpy.uint8, mode='w+', shape=(1, ))
+
+        self.meta = meta
 
     def _wait_for_buffers(self):
         # if folder exists, remove it
@@ -366,6 +370,8 @@ class SharedMemoryServer:
                     self.add_client(cn)
 
     def add_client(self, name):
+        if name in self.clients:
+            del self.clients[name]
         self.clients[name] = SharedMemoryBuffers(
             name, self.meta, server_folder=self.folder, create=True)
         self.clients[name].set_status(STATUS_IDLE)
@@ -379,6 +385,7 @@ class SharedMemoryServer:
                 b.set_output(self.model.run(b.input_array))
                 b.set_status(STATUS_OUTPUT_READY)
                 r = True
+        return r
 
     def run_forever(self):
         while True:
