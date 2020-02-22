@@ -29,8 +29,6 @@ client connects:
     - client connects to buffers
 """
 
-import base64
-import logging
 import os
 import pickle
 import shutil
