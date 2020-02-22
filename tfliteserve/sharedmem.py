@@ -38,8 +38,6 @@ import time
 
 import numpy
 
-from . import model
-
 
 default_server_folder = '/dev/shm/tfliteserver'
 
@@ -56,6 +54,22 @@ status_code_to_name = {
     STATUS_OUTPUT_READY: 'output ready',
 }
 status_name_to_code = {v: k for k, v in status_code_to_name.items()}
+
+
+def validate_meta(meta):
+    if 'input' not in meta:
+        raise ValueError("Invalid metadata missing input")
+
+    if 'output' not in meta:
+        raise ValueError("Invalid metadata missing output")
+
+    for k in ('input', 'output'):
+        if k not in meta:
+            raise ValueError("Invalid metadata missing %s" % k)
+        for sk in ('shape', 'dtype'):
+            if sk not in meta[k]:
+                raise ValueError("Invalid metadata missing %s %s" % (k, sk))
+
 
 
 class SharedMemoryBuffers:
@@ -148,14 +162,16 @@ class SharedMemoryBuffers:
             with open(mfn, 'wb') as f:
                 pickle.dump(meta, f)
 
-        if 'input' not in meta:
-            raise ValueError("Invalid metadata missing input")
+        validate_meta(meta)
 
-        if 'output' not in meta:
-            raise ValueError("Invalid metadata missing output")
+        #if 'input' not in meta:
+        #    raise ValueError("Invalid metadata missing input")
+
+        #if 'output' not in meta:
+        #    raise ValueError("Invalid metadata missing output")
         
-        if 'labels' not in meta:
-            meta['labels'] = {}
+        #if 'labels' not in meta:
+        #    meta['labels'] = {}
 
         input_shape = tuple(meta['input']['shape'])
         input_dtype = numpy.dtype(meta['input']['dtype'])
@@ -166,10 +182,11 @@ class SharedMemoryBuffers:
 
         # if output is quantized, it's dtype won't match output_details
         output_shape = tuple(meta['output']['shape'])
-        if 'quantization' in meta['output']:
-            output_dtype = numpy.dtype('f8')
-        else:
-            output_dtype = numpy.dtype(meta['output']['dtype'])
+        output_dtype = numpy.dtype(meta['output']['dtype'])
+        #if 'quantization' in meta['output']:
+        #    output_dtype = numpy.dtype('f8')
+        #else:
+        #    output_dtype = numpy.dtype(meta['output']['dtype'])
 
         self.output_array = numpy.memmap(
             os.path.join(self.folder, 'output'),
@@ -346,18 +363,21 @@ class SharedMemoryBuffers:
 
 
 class SharedMemoryServer:
-    def __init__(self, model, poll_delay=0.0001, server_folder=None):
-        self.model = model
+    def __init__(self, function, meta, poll_delay=0.0001, server_folder=None):
+        self.function = function
         if server_folder is None:
             server_folder = default_server_folder
         self.folder = server_folder
+        if not os.path.exists(self.folder):
+            os.makedirs(self.folder)
         self.poll_delay = poll_delay
         self.clients = {}
-        self.meta = {
-            'input': model.input_details,
-            'output': model.output_details,
-            'labels': model.labels,
-        }
+        validate_meta(meta)
+        self.meta = meta
+        #    'input': model.input_details,
+        #    'output': model.output_details,
+        #    'labels': model.labels,
+        #}
 
     def check_for_new_clients(self):
         for cn in os.listdir(self.folder):
@@ -382,7 +402,7 @@ class SharedMemoryServer:
             b = self.clients[cn]
             if b.get_status() == STATUS_INPUT_READY:
                 b.set_status(STATUS_PROCESSING)
-                b.set_output(self.model.run(b.input_array))
+                b.set_output(self.function(b.input_array))
                 b.set_status(STATUS_OUTPUT_READY)
                 r = True
         return r
@@ -412,3 +432,6 @@ class SharedMemoryClient:
         o = self.buffers.get_output(copy=True)
         self.buffers.set_status(STATUS_IDLE)
         return o
+    
+    def __call__(self, *args, **kwargs):
+        return self.run(*args, **kwargs)

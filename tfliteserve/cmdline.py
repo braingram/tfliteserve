@@ -21,5 +21,5 @@ def run_server():
     args = parser.parse_args()
 
     m = model.TFLiteModel(args.model, args.labels, edge=args.edge)
-    s = sharedmem.SharedMemoryServer(m, poll_delay=args.poll_delay)
+    s = sharedmem.SharedMemoryServer(m, m.meta, poll_delay=args.poll_delay)
     s.run_forever()

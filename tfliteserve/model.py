@@ -55,6 +55,14 @@ class TFLiteModel:
         self.output_tensor_index = self.output_details['index']
         self.q_out_scale, self.q_out_zero = self.output_details['quantization']
 
+        self.meta = {
+            'input': self.input_details,
+            'output': self.output_details,
+            'labels': self.labels,
+        }
+        if 'quantization' in self.meta['output']:
+            self.meta['output']['dtype'] = 'f8'
+
     def set_input(self, input_tensor):
         if input_tensor.dtype != self.input_details['dtype']:
             print("Converting input dtype:", input_tensor.dtype, self.input_details['dtype'])
@@ -77,3 +85,6 @@ class TFLiteModel:
         self.set_input(input_tensor)
         self.model.invoke()
         return self.get_output()
+
+    def __call__(self, *args, **kwargs):
+        return self.run(*args, **kwargs)
