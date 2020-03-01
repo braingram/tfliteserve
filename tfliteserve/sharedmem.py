@@ -219,7 +219,8 @@ class SharedMemoryBuffers:
         #    shutil.rmtree(self.folder)
         #    while os.path.exists(self.folder):
         #        time.sleep(0.001)
-        #os.makedirs(self.folder)
+        if not os.path.exists(self.folder):
+            os.makedirs(self.folder)
         mfn = os.path.join(self.folder, 'meta')
         while not os.path.exists(mfn):
             time.sleep(0.001)
