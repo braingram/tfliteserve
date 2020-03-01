@@ -4,11 +4,6 @@
 the shared buffers include: 
     input array
     output array (after quantization removal)
-    status [1 byte]
-        0 idle [set by client, after output is read]
-        1 input ready [set by client]
-        2 processing [set by server]
-        3 output ready [set by server]
 
 Need separate codes per client, clients will need to have a unique channel.
 Channel negotiation is... complicated, skip it, just pre-assign.
@@ -18,7 +13,6 @@ Each client should make it's own folder
 main_dir: /dev/shm/tfliteserver
 
 each client directory has:
-    - status
     - input
     - output
     - meta: input/output details
@@ -41,20 +35,6 @@ import numpy
 
 default_server_folder = '/dev/shm/tfliteserver'
 
-STATUS_IDLE = 0
-STATUS_INPUT_READY = 1
-STATUS_PROCESSING = 2
-STATUS_OUTPUT_READY = 3
-STATUS_CLIENT_PING = 10
-
-status_code_to_name = {
-    STATUS_IDLE: 'idle',
-    STATUS_INPUT_READY: 'input ready',
-    STATUS_PROCESSING: 'processing',
-    STATUS_OUTPUT_READY: 'output ready',
-}
-status_name_to_code = {v: k for k, v in status_code_to_name.items()}
-
 
 def validate_meta(meta):
     if 'input' not in meta:
@@ -71,7 +51,6 @@ def validate_meta(meta):
                 raise ValueError("Invalid metadata missing %s %s" % (k, sk))
 
 
-
 class SharedMemoryBuffers:
     """
     Construct shared buffers (or access existing ones) in a folder on disk.
@@ -80,11 +59,8 @@ class SharedMemoryBuffers:
     processes (Clients) via the input_array shared buffer and results
     are returned from the Server to the Client via the output_array.
     
-    Coordination of the shared buffers occures via transmission of codes
-    via the status_array. See get_status for a description of codes.
+    Coordination of the shared buffers occures via two fifos.
 
-    Processing proceeds as follows:
-        TODO
 
     Parameters
     ---------
@@ -112,10 +88,6 @@ class SharedMemoryBuffers:
     output_array: numpy.memmap
         Shape = meta['input']['shape'], dtype = meta['input]['dtype']
         if model has quantization, dtype will be overridden as float64
-    status_array: numpy.memmap
-        single element, uint8 array containing a status byte that
-        defines when the input or output is safe to read or write
-        see get_status
 
     Methods
     -------
@@ -123,16 +95,11 @@ class SharedMemoryBuffers:
     get_input: Get contents or reference of input array.
     set_output: Copy values into output array shared buffer. 
     get_output: Get contents or reference of output array.
-    get_status: Get current status code or string.
-    set_status: Set current status code or string.
-    wait_for_status: Wait until status changes to a provided code.
 
     Notes
     -----
     Direct use of arrays (without copying values) is very discouraged as
-    these memmapped values can be changed by other processes. Instead,
-    use wait_for_status to know when it is safe to read or write an array
-    using the get/set_input/output methods.
+    these memmapped values can be changed by other processes.
 
     Examples
     --------
@@ -190,11 +157,6 @@ class SharedMemoryBuffers:
             os.path.join(self.folder, 'output'),
             dtype=output_dtype, mode='w+', shape=output_shape)
         
-        # status file/pipe?
-        #self.status_array = numpy.memmap(
-        #    os.path.join(self.folder, 'status'),
-        #    dtype=numpy.uint8, mode='w+', shape=(1, ))
-
         if self.is_client:
             self.output_ready_fp = open(or_fn, 'r')
             self.input_ready_fp = open(ir_fn, 'w')
@@ -248,9 +210,7 @@ class SharedMemoryBuffers:
         ----------
         copy: bool, default=True
             if True, copy contents of input_array, if False a reference
-            to input_array will be returned. Use of the reference should
-            be restricted to times when get_status returns a safe code.
-            see get_status for more information.
+            to input_array will be returned.
 
         Returns
         -------
@@ -283,9 +243,7 @@ class SharedMemoryBuffers:
         ----------
         copy: bool, default=True
             if True, copy contents of output_array, if False a reference
-            to output_array will be returned. Use of the reference should
-            be restricted to times when get_status returns a safe code.
-            see get_status for more information.
+            to output_array will be returned.
 
         Returns
         -------
@@ -295,94 +253,6 @@ class SharedMemoryBuffers:
         if copy:
             return numpy.copy(self.output_array)
         return self.output_array
-
-#    def get_status(self, parse=False):
-#        """Get the current status code or string
-#
-#        Status codes and allowable acces to input and output arrays are:
-#            0: idle
-#                No buffers are being processed, it is safe to write to the
-#                input_array and then set the status to 'input ready'
-#                    input_array: rw
-#                    output_array: rw
-#            1: input ready
-#                New values were written to input array and are awaiting
-#                processing. No access is permitted.
-#                    input_array: -
-#                    output_array: -
-#            2: processing
-#                Current buffers are being processed. No access is permitted.
-#                    input_array: -
-#                    output_array: -
-#            3: output ready
-#                New output was generated it should be read from output_array
-#                and the status set to idle
-#                    input_array: rw
-#                    output_array: rw
-#
-#        Parameters
-#        ----------
-#        parse: bool, default=False
-#            If True, lookup and return the string description of the status
-#
-#        Returns
-#        -------
-#        status: int or string
-#            Current status code or description (see parse above)
-#        """
-#        if parse:
-#            return status_value_to_name[self.status_array[0]]
-#        return int(self.status_array[0])
-#    
-#    def set_status(self, code):
-#        """Set the current status code
-#
-#        Parameters
-#        ----------
-#        code: int or string
-#            Status code or description (see get_status)
-#        """
-#        if isinstance(code, str):
-#            code = status_name_to_code[code]
-#        self.status_array[0] = code
-#        self.status_array.flush()
-#    
-#    def wait_for_status(self, code, timeout=None, delay=None):
-#        """Wait until status changes to the provided code
-#
-#        Parameters
-#        ----------
-#        code: int or string
-#            Status code or description (see get_status) to wait for.
-#        timeout: float or None
-#            If None, function blocks until status matches code. If float,
-#            wait for a maximum of timeout seconds.
-#        delay: float or None
-#            If None, blocking polls status with no delay. If float, wait
-#            for delay seconds between checks of status code.
-#
-#        Returns
-#        -------
-#        status_reached: bool
-#            True if status code matched, False if timed out before code
-#            matched.
-#        """
-#        if isinstance(code, str):
-#            code = status_name_to_code[code]
-#        if delay is None:
-#            wait = lambda: None
-#        else:
-#            wait = lambda: time.sleep(delay)
-#        if timeout is None:
-#            should_exit = lambda: False
-#        else:
-#            t0 = time.monotonic()
-#            should_exit = lambda: ((time.monotonic() - t0) > timeout)
-#        while self.status_array[0] != code:
-#            wait()
-#            if should_exit():
-#                return False
-#        return True
 
 
 class SharedMemoryServer:
@@ -397,21 +267,17 @@ class SharedMemoryServer:
         self.clients = {}
         validate_meta(meta)
         self.meta = meta
-        #    'input': model.input_details,
-        #    'output': model.output_details,
-        #    'labels': model.labels,
-        #}
+
+        # make junk data
+        self.junk_input = numpy.random.randint(
+            0, 255, size=self.meta['input']['shape'],
+            dtype=self.meta['input']['dtype'])
 
     def check_for_new_clients(self):
         for cn in os.listdir(self.folder):
             if cn not in self.clients:
                 self.add_client(cn)
-            #else:
-            #    raise NotImplemented("Re-adding client not yet ready")
-                # check for status file
-                #sfn = os.path.join(self.folder, cn, 'status')
-                #if not os.path.exists(sfn):
-                #    self.add_client(cn)
+            # else:  # TODO check if client is still alive, read if not
         self.loop.call_later(
             1.0, self.check_for_new_clients)
 
@@ -420,21 +286,8 @@ class SharedMemoryServer:
             del self.clients[name]
         self.clients[name] = SharedMemoryBuffers(
             name, self.meta, server_folder=self.folder, create=True)
-        #self.clients[name].set_status(STATUS_IDLE)
-        # setup ioloop to watch input_ready_fp
         self.loop.add_reader(
             self.clients[name].input_ready_fp, self.run_client, name)
-
-#    def check_clients(self):
-#        r = False
-#        for cn in self.clients:
-#            b = self.clients[cn]
-#            if b.get_status() == STATUS_INPUT_READY:
-#                b.set_status(STATUS_PROCESSING)
-#                b.set_output(self.function(b.input_array))
-#                b.set_status(STATUS_OUTPUT_READY)
-#                r = True
-#        return r
 
     def run_client(self, client_name):
         print("Running client: %s" % client_name)
@@ -442,19 +295,22 @@ class SharedMemoryServer:
         b.input_ready_fp.read(1)
         b.set_output(self.function(b.input_array))
 
+    def run_junk(self):
+        self.function(self.junk_input)
+        self.loop.call_later(
+            0.010, self.run_junk)
+
     def run_forever(self, loop=None):
         if loop is None:
             loop = asyncio.get_event_loop()
         
         self.loop = loop
         self.loop.call_soon(self.check_for_new_clients)
+        
+        self.loop.call_soon(self.run_junk)
 
         self.loop.run_forever()
         self.loop.close()
-#        while True:
-#            if not self.check_clients():
-#                self.check_for_new_clients()  # TODO only do this periodically
-#                time.sleep(self.poll_delay)
 
 
 class SharedMemoryClient:
@@ -470,17 +326,5 @@ class SharedMemoryClient:
         self.buffers.output_ready_fp.read(1)
         return self.buffers.get_output(copy=True)
 
-#        if not self.buffers.wait_for_status(
-#                STATUS_IDLE, timeout=timeout, delay=delay):
-#            return None
-#        self.buffers.set_input(input_array)
-#        self.buffers.set_status(STATUS_INPUT_READY)
-#        if not self.buffers.wait_for_status(
-#                STATUS_OUTPUT_READY, timeout=timeout, delay=delay):
-#            return None
-#        o = self.buffers.get_output(copy=True)
-#        self.buffers.set_status(STATUS_IDLE)
-#        return o
-    
     def __call__(self, *args, **kwargs):
         return self.run(*args, **kwargs)
