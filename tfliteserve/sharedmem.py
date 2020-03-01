@@ -29,8 +29,10 @@ client connects:
     - client connects to buffers
 """
 
+import asyncio
 import os
 import pickle
+import select
 import shutil
 import time
 
@@ -140,6 +142,7 @@ class SharedMemoryBuffers:
             server_folder = default_server_folder
         folder = os.path.join(server_folder, name)
         self.folder = folder
+        self.is_client = None
         if create:
             if meta is None:
                 raise ValueError("meta is required if creating buffers")
@@ -149,27 +152,29 @@ class SharedMemoryBuffers:
 
     def _create_buffers(self, meta=None):
         mfn = os.path.join(self.folder, 'meta')
+
+        ir_fn = os.path.join(self.folder, 'input_ready')  # to server
+        or_fn = os.path.join(self.folder, 'output_ready')  # to client
+
         if meta is None:
+            self.is_client = True
             # load meta from directory
             with open(mfn, 'rb') as f:
                 meta = pickle.load(f)
         else:
+            self.is_client = False
             if not os.path.exists(self.folder):
                 os.makedirs(self.folder)
+            for fn in (ir_fn, or_fn):
+                if not os.path.exists(fn):
+                    os.mkfifo(fn)
             # write meta to directory
+            print("Saving meta to %s" % mfn)
             with open(mfn, 'wb') as f:
                 pickle.dump(meta, f)
 
         validate_meta(meta)
-
-        #if 'input' not in meta:
-        #    raise ValueError("Invalid metadata missing input")
-
-        #if 'output' not in meta:
-        #    raise ValueError("Invalid metadata missing output")
-        
-        #if 'labels' not in meta:
-        #    meta['labels'] = {}
+        self.meta = meta
 
         input_shape = tuple(meta['input']['shape'])
         input_dtype = numpy.dtype(meta['input']['dtype'])
@@ -178,34 +183,45 @@ class SharedMemoryBuffers:
             os.path.join(self.folder, 'input'),
             dtype=input_dtype, mode='w+', shape=input_shape)
 
-        # if output is quantized, it's dtype won't match output_details
         output_shape = tuple(meta['output']['shape'])
         output_dtype = numpy.dtype(meta['output']['dtype'])
-        #if 'quantization' in meta['output']:
-        #    output_dtype = numpy.dtype('f8')
-        #else:
-        #    output_dtype = numpy.dtype(meta['output']['dtype'])
 
         self.output_array = numpy.memmap(
             os.path.join(self.folder, 'output'),
             dtype=output_dtype, mode='w+', shape=output_shape)
         
         # status file/pipe?
-        self.status_array = numpy.memmap(
-            os.path.join(self.folder, 'status'),
-            dtype=numpy.uint8, mode='w+', shape=(1, ))
+        #self.status_array = numpy.memmap(
+        #    os.path.join(self.folder, 'status'),
+        #    dtype=numpy.uint8, mode='w+', shape=(1, ))
 
-        self.meta = meta
+        if self.is_client:
+            self.output_ready_fp = open(or_fn, 'r')
+            self.input_ready_fp = open(ir_fn, 'w')
+            ffp = self.output_ready_fp
+        else:
+            self.output_ready_fp = open(or_fn, 'w')
+            self.input_ready_fp = open(ir_fn, 'r')
+            ffp = self.input_ready_fp
+
+        # flush input
+        while ffp in select.select([ffp,], [], [], 0.001)[0]:
+            ffp.read(1)
+
+    def __del__(self):
+        self.input_ready_fp.close()
+        self.output_ready_fp.close()
 
     def _wait_for_buffers(self):
+        # TODO update this for new input/output_ready_fp
         # if folder exists, remove it
-        if os.path.exists(self.folder):
-            shutil.rmtree(self.folder)
-            while os.path.exists(self.folder):
-                time.sleep(0.001)
-        os.makedirs(self.folder)
-        sfn = os.path.join(self.folder, 'status')
-        while not os.path.exists(sfn):
+        #if os.path.exists(self.folder):
+        #    shutil.rmtree(self.folder)
+        #    while os.path.exists(self.folder):
+        #        time.sleep(0.001)
+        #os.makedirs(self.folder)
+        mfn = os.path.join(self.folder, 'meta')
+        while not os.path.exists(mfn):
             time.sleep(0.001)
         self._create_buffers()
 
@@ -217,8 +233,12 @@ class SharedMemoryBuffers:
         values: ndarray
             Must be the same size and dtype of input_array
         """
+        assert self.is_client
         self.input_array[:] = values
         self.input_array.flush()
+
+        self.input_ready_fp.write("1")
+        self.input_ready_fp.flush()
 
     def get_input(self, copy=True):
         """Get a copy of or reference to input_array
@@ -248,8 +268,12 @@ class SharedMemoryBuffers:
         values: ndarray
             Must be the same size and dtype of output_array
         """
+        assert not self.is_client
         self.output_array[:] = values
         self.output_array.flush()
+
+        self.output_ready_fp.write("1")
+        self.output_ready_fp.flush()
 
     def get_output(self, copy=True):
         """Get a copy of or reference to output_array
@@ -271,93 +295,93 @@ class SharedMemoryBuffers:
             return numpy.copy(self.output_array)
         return self.output_array
 
-    def get_status(self, parse=False):
-        """Get the current status code or string
-
-        Status codes and allowable acces to input and output arrays are:
-            0: idle
-                No buffers are being processed, it is safe to write to the
-                input_array and then set the status to 'input ready'
-                    input_array: rw
-                    output_array: rw
-            1: input ready
-                New values were written to input array and are awaiting
-                processing. No access is permitted.
-                    input_array: -
-                    output_array: -
-            2: processing
-                Current buffers are being processed. No access is permitted.
-                    input_array: -
-                    output_array: -
-            3: output ready
-                New output was generated it should be read from output_array
-                and the status set to idle
-                    input_array: rw
-                    output_array: rw
-
-        Parameters
-        ----------
-        parse: bool, default=False
-            If True, lookup and return the string description of the status
-
-        Returns
-        -------
-        status: int or string
-            Current status code or description (see parse above)
-        """
-        if parse:
-            return status_value_to_name[self.status_array[0]]
-        return int(self.status_array[0])
-    
-    def set_status(self, code):
-        """Set the current status code
-
-        Parameters
-        ----------
-        code: int or string
-            Status code or description (see get_status)
-        """
-        if isinstance(code, str):
-            code = status_name_to_code[code]
-        self.status_array[0] = code
-        self.status_array.flush()
-    
-    def wait_for_status(self, code, timeout=None, delay=None):
-        """Wait until status changes to the provided code
-
-        Parameters
-        ----------
-        code: int or string
-            Status code or description (see get_status) to wait for.
-        timeout: float or None
-            If None, function blocks until status matches code. If float,
-            wait for a maximum of timeout seconds.
-        delay: float or None
-            If None, blocking polls status with no delay. If float, wait
-            for delay seconds between checks of status code.
-
-        Returns
-        -------
-        status_reached: bool
-            True if status code matched, False if timed out before code
-            matched.
-        """
-        if isinstance(code, str):
-            code = status_name_to_code[code]
-        if delay is None:
-            wait = lambda: None
-        else:
-            wait = lambda: time.sleep(delay)
-        if timeout is None:
-            should_exit = lambda: False
-        else:
-            t0 = time.monotonic()
-            should_exit = lambda: ((time.monotonic() - t0) > timeout)
-        while self.status_array[0] != code:
-            wait()
-            if should_exit():
-                return False
-        return True
+#    def get_status(self, parse=False):
+#        """Get the current status code or string
+#
+#        Status codes and allowable acces to input and output arrays are:
+#            0: idle
+#                No buffers are being processed, it is safe to write to the
+#                input_array and then set the status to 'input ready'
+#                    input_array: rw
+#                    output_array: rw
+#            1: input ready
+#                New values were written to input array and are awaiting
+#                processing. No access is permitted.
+#                    input_array: -
+#                    output_array: -
+#            2: processing
+#                Current buffers are being processed. No access is permitted.
+#                    input_array: -
+#                    output_array: -
+#            3: output ready
+#                New output was generated it should be read from output_array
+#                and the status set to idle
+#                    input_array: rw
+#                    output_array: rw
+#
+#        Parameters
+#        ----------
+#        parse: bool, default=False
+#            If True, lookup and return the string description of the status
+#
+#        Returns
+#        -------
+#        status: int or string
+#            Current status code or description (see parse above)
+#        """
+#        if parse:
+#            return status_value_to_name[self.status_array[0]]
+#        return int(self.status_array[0])
+#    
+#    def set_status(self, code):
+#        """Set the current status code
+#
+#        Parameters
+#        ----------
+#        code: int or string
+#            Status code or description (see get_status)
+#        """
+#        if isinstance(code, str):
+#            code = status_name_to_code[code]
+#        self.status_array[0] = code
+#        self.status_array.flush()
+#    
+#    def wait_for_status(self, code, timeout=None, delay=None):
+#        """Wait until status changes to the provided code
+#
+#        Parameters
+#        ----------
+#        code: int or string
+#            Status code or description (see get_status) to wait for.
+#        timeout: float or None
+#            If None, function blocks until status matches code. If float,
+#            wait for a maximum of timeout seconds.
+#        delay: float or None
+#            If None, blocking polls status with no delay. If float, wait
+#            for delay seconds between checks of status code.
+#
+#        Returns
+#        -------
+#        status_reached: bool
+#            True if status code matched, False if timed out before code
+#            matched.
+#        """
+#        if isinstance(code, str):
+#            code = status_name_to_code[code]
+#        if delay is None:
+#            wait = lambda: None
+#        else:
+#            wait = lambda: time.sleep(delay)
+#        if timeout is None:
+#            should_exit = lambda: False
+#        else:
+#            t0 = time.monotonic()
+#            should_exit = lambda: ((time.monotonic() - t0) > timeout)
+#        while self.status_array[0] != code:
+#            wait()
+#            if should_exit():
+#                return False
+#        return True
 
 
 class SharedMemoryServer:
@@ -381,35 +405,55 @@ class SharedMemoryServer:
         for cn in os.listdir(self.folder):
             if cn not in self.clients:
                 self.add_client(cn)
-            else:
+            #else:
+            #    raise NotImplemented("Re-adding client not yet ready")
                 # check for status file
-                sfn = os.path.join(self.folder, cn, 'status')
-                if not os.path.exists(sfn):
-                    self.add_client(cn)
+                #sfn = os.path.join(self.folder, cn, 'status')
+                #if not os.path.exists(sfn):
+                #    self.add_client(cn)
+        self.loop.call_later(
+            1.0, self.check_for_new_clients)
 
     def add_client(self, name):
         if name in self.clients:
             del self.clients[name]
         self.clients[name] = SharedMemoryBuffers(
             name, self.meta, server_folder=self.folder, create=True)
-        self.clients[name].set_status(STATUS_IDLE)
+        #self.clients[name].set_status(STATUS_IDLE)
+        # setup ioloop to watch input_ready_fp
+        self.loop.add_reader(
+            self.clients[name].input_ready_fp, self.run_client, name)
 
-    def check_clients(self):
-        r = False
-        for cn in self.clients:
-            b = self.clients[cn]
-            if b.get_status() == STATUS_INPUT_READY:
-                b.set_status(STATUS_PROCESSING)
-                b.set_output(self.function(b.input_array))
-                b.set_status(STATUS_OUTPUT_READY)
-                r = True
-        return r
+#    def check_clients(self):
+#        r = False
+#        for cn in self.clients:
+#            b = self.clients[cn]
+#            if b.get_status() == STATUS_INPUT_READY:
+#                b.set_status(STATUS_PROCESSING)
+#                b.set_output(self.function(b.input_array))
+#                b.set_status(STATUS_OUTPUT_READY)
+#                r = True
+#        return r
 
-    def run_forever(self):
-        while True:
-            if not self.check_clients():
-                self.check_for_new_clients()  # TODO only do this periodically
-                time.sleep(self.poll_delay)
+    def run_client(self, client_name):
+        print("Running client: %s" % client_name)
+        b = self.clients[client_name]
+        b.input_ready_fp.read(1)
+        b.set_output(self.function(b.input_array))
+
+    def run_forever(self, loop=None):
+        if loop is None:
+            loop = asyncio.get_event_loop()
+        
+        self.loop = loop
+        self.loop.call_soon(self.check_for_new_clients)
+
+        self.loop.run_forever()
+        self.loop.close()
+#        while True:
+#            if not self.check_clients():
+#                self.check_for_new_clients()  # TODO only do this periodically
+#                time.sleep(self.poll_delay)
 
 
 class SharedMemoryClient:
@@ -419,17 +463,23 @@ class SharedMemoryClient:
             name, server_folder=server_folder, create=False)
 
     def run(self, input_array, timeout=None, delay=None):
-        if not self.buffers.wait_for_status(
-                STATUS_IDLE, timeout=timeout, delay=delay):
-            return None
         self.buffers.set_input(input_array)
-        self.buffers.set_status(STATUS_INPUT_READY)
-        if not self.buffers.wait_for_status(
-                STATUS_OUTPUT_READY, timeout=timeout, delay=delay):
-            return None
-        o = self.buffers.get_output(copy=True)
-        self.buffers.set_status(STATUS_IDLE)
-        return o
+
+        # TODO better integrate this with the buffers
+        self.buffers.output_ready_fp.read(1)
+        return self.buffers.get_output(copy=True)
+
+#        if not self.buffers.wait_for_status(
+#                STATUS_IDLE, timeout=timeout, delay=delay):
+#            return None
+#        self.buffers.set_input(input_array)
+#        self.buffers.set_status(STATUS_INPUT_READY)
+#        if not self.buffers.wait_for_status(
+#                STATUS_OUTPUT_READY, timeout=timeout, delay=delay):
+#            return None
+#        o = self.buffers.get_output(copy=True)
+#        self.buffers.set_status(STATUS_IDLE)
+#        return o
     
     def __call__(self, *args, **kwargs):
         return self.run(*args, **kwargs)
