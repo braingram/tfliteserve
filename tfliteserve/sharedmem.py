@@ -24,6 +24,7 @@ client connects:
 """
 
 import asyncio
+import logging
 import os
 import pickle
 import select
@@ -136,7 +137,6 @@ class SharedMemoryBuffers:
                 if not os.path.exists(fn):
                     os.mkfifo(fn)
             # write meta to directory
-            print("Saving meta to %s" % mfn)
             with open(mfn, 'wb') as f:
                 pickle.dump(meta, f)
 
@@ -186,7 +186,7 @@ class SharedMemoryBuffers:
                 'output_ready']
         ]
         for fn in fns:
-            print("Waiting for %s" % fn)
+            logging.debug("Waiting for %s", fn)
             while not os.path.exists(fn):
                 time.sleep(0.001)
         self._create_buffers()
@@ -270,14 +270,10 @@ class SharedMemoryServer:
         validate_meta(meta)
         self.meta = meta
 
-        # make junk data
-        #self.junk_input = numpy.random.randint(
-        #    0, 255, size=self.meta['input']['shape'],
-        #    dtype=self.meta['input']['dtype'])
-
     def check_for_new_clients(self):
         for cn in os.listdir(self.folder):
             if cn not in self.clients:
+                logging.debug("Adding client: %s", cn)
                 self.add_client(cn)
             # else:  # TODO check if client is still alive, read if not
         self.loop.call_later(
@@ -292,15 +288,9 @@ class SharedMemoryServer:
             self.clients[name].input_ready_fp, self.run_client, name)
 
     def run_client(self, client_name):
-        print("Running client: %s" % client_name)
         b = self.clients[client_name]
         b.input_ready_fp.read(1)
         b.set_output(self.function(b.input_array))
-
-    #def run_junk(self):
-    #    self.function(self.junk_input)
-    #    self.loop.call_later(
-    #        0.010, self.run_junk)
 
     def run_forever(self, loop=None):
         if loop is None:
@@ -309,8 +299,6 @@ class SharedMemoryServer:
         self.loop = loop
         self.loop.call_soon(self.check_for_new_clients)
         
-        #self.loop.call_soon(self.run_junk)
-
         self.loop.run_forever()
         self.loop.close()
 
