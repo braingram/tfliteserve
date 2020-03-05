@@ -1,9 +1,12 @@
+import asyncio
 import time
 
 import numpy
 
 import tflite_runtime.interpreter as tflite
 load_delegate = tflite.load_delegate
+
+from . import sharedmem
 
 
 EDGETPU_SHARED_LIB = 'libedgetpu.so.1'
@@ -88,3 +91,35 @@ class TFLiteModel:
 
     def __call__(self, *args, **kwargs):
         return self.run(*args, **kwargs)
+
+
+class TFLiteServer(sharedmem.SharedMemoryServer):
+    def __init__(self, model, server_folder=None, junk_period=None):
+        super(TFLiteServer, self).__init__(
+            model, model.meta, server_folder)
+        self.junk_input = numpy.random.randint(
+            0, 255, size=model.meta['input']['shape'],
+            dtype=model.meta['input']['dtype'])
+        self.junk_period = junk_period
+        self.last_run = time.monotonic()
+
+    def run_client(self, client_name):
+        self.last_run = time.monotonic()
+        super(TFLiteServer, self).run_client(client_name)
+
+    def run_junk(self):
+        t = time.monotonic()
+        if t - self.last_run > self.junk_period:
+            self.function(self.junk_input)
+            self.last_run = t
+        dt = self.last_run + self.junk_period - t
+        self.loop.call_later(dt, self.run_junk)
+
+    def run_forever(self, loop=None):
+        if loop is None:
+            loop = asyncio.get_event_loop()
+
+        if self.junk_period is not None:
+            loop.call_soon(self.run_junk)
+
+        super(TFLiteServer, self).run_forever(loop)

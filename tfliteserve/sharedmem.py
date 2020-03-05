@@ -175,17 +175,20 @@ class SharedMemoryBuffers:
         self.output_ready_fp.close()
 
     def _wait_for_buffers(self):
-        # TODO update this for new input/output_ready_fp
-        # if folder exists, remove it
-        #if os.path.exists(self.folder):
-        #    shutil.rmtree(self.folder)
-        #    while os.path.exists(self.folder):
-        #        time.sleep(0.001)
         if not os.path.exists(self.folder):
             os.makedirs(self.folder)
-        mfn = os.path.join(self.folder, 'meta')
-        while not os.path.exists(mfn):
-            time.sleep(0.001)
+        fns = [
+            os.path.join(self.folder, fn) for fn in [
+                'meta',
+                'input',
+                'output',
+                'input_ready',
+                'output_ready']
+        ]
+        for fn in fns:
+            print("Waiting for %s" % fn)
+            while not os.path.exists(fn):
+                time.sleep(0.001)
         self._create_buffers()
 
     def set_input(self, values):
@@ -256,22 +259,21 @@ class SharedMemoryBuffers:
 
 
 class SharedMemoryServer:
-    def __init__(self, function, meta, poll_delay=0.0001, server_folder=None):
+    def __init__(self, function, meta, server_folder=None):
         self.function = function
         if server_folder is None:
             server_folder = default_server_folder
         self.folder = server_folder
         if not os.path.exists(self.folder):
             os.makedirs(self.folder)
-        self.poll_delay = poll_delay
         self.clients = {}
         validate_meta(meta)
         self.meta = meta
 
         # make junk data
-        self.junk_input = numpy.random.randint(
-            0, 255, size=self.meta['input']['shape'],
-            dtype=self.meta['input']['dtype'])
+        #self.junk_input = numpy.random.randint(
+        #    0, 255, size=self.meta['input']['shape'],
+        #    dtype=self.meta['input']['dtype'])
 
     def check_for_new_clients(self):
         for cn in os.listdir(self.folder):
@@ -295,10 +297,10 @@ class SharedMemoryServer:
         b.input_ready_fp.read(1)
         b.set_output(self.function(b.input_array))
 
-    def run_junk(self):
-        self.function(self.junk_input)
-        self.loop.call_later(
-            0.010, self.run_junk)
+    #def run_junk(self):
+    #    self.function(self.junk_input)
+    #    self.loop.call_later(
+    #        0.010, self.run_junk)
 
     def run_forever(self, loop=None):
         if loop is None:
@@ -307,7 +309,7 @@ class SharedMemoryServer:
         self.loop = loop
         self.loop.call_soon(self.check_for_new_clients)
         
-        self.loop.call_soon(self.run_junk)
+        #self.loop.call_soon(self.run_junk)
 
         self.loop.run_forever()
         self.loop.close()
