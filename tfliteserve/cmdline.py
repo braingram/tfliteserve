@@ -37,5 +37,6 @@ def run_server():
         s = sharedmem.SharedMemoryServer(f, meta)
     else:
         m = model.TFLiteModel(args.model, args.labels, edge=args.edge)
-        s = model.TFLiteServer(m, junk_period=args.junk)
+        junk = None if args.junk == 0.0 else args.junk
+        s = model.TFLiteServer(m, junk_period=junk)
     s.run_forever()

@@ -86,7 +86,19 @@ class TFLiteModel:
 
     def run(self, input_tensor):
         self.set_input(input_tensor)
+        #t0 = time.monotonic()
         self.model.invoke()
+        #t1 = time.monotonic()
+        #if not hasattr(self, '_run_stats'):
+        #    self._run_stats = {'n': 0, 'dts': 0}
+        #dt = t1 - t0
+        #self._run_stats['n'] += 1
+        #self._run_stats['dts'] += dt
+        #if self._run_stats['n'] > 99:
+        #    n = self._run_stats['n']
+        #    adt = self._run_stats['dts'] / n
+        #    print("Average run time over %i calls: %s" % (n, adt))
+        #    del self._run_stats
         return self.get_output()
 
     def __call__(self, *args, **kwargs):
@@ -120,6 +132,7 @@ class TFLiteServer(sharedmem.SharedMemoryServer):
             loop = asyncio.get_event_loop()
 
         if self.junk_period is not None:
+            print("Running junk data every %s seconds" % self.junk_period)
             loop.call_soon(self.run_junk)
 
         super(TFLiteServer, self).run_forever(loop)
