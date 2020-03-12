@@ -171,8 +171,16 @@ class SharedMemoryBuffers:
             ffp.read(1)
 
     def __del__(self):
-        self.input_ready_fp.close()
-        self.output_ready_fp.close()
+        if not self.input_ready_fp.closed:
+            try:
+                self.input_ready_fp.close()
+            except BrokenPipeError:
+                print("input_ready_fp.close() resulted in broken pipe")
+        if not self.output_ready_fp.closed:
+            try:
+                self.output_ready_fp.close()
+            except BrokenPipeError:
+                print("output_ready_fp.close() resulted in broken pipe")
 
     def _wait_for_buffers(self):
         if not os.path.exists(self.folder):
@@ -290,7 +298,12 @@ class SharedMemoryServer:
     def run_client(self, client_name):
         b = self.clients[client_name]
         b.input_ready_fp.read(1)
-        b.set_output(self.function(b.input_array))
+        try:
+            b.set_output(self.function(b.input_array))
+        except BrokenPipeError as e:
+            print("Client connection failed: %s[%s]" % (client_name, e))
+            self.loop.remove_reader(self.clients[client_name].input_ready_fp)
+            del self.clients[client_name]
 
     def run_forever(self, loop=None):
         if loop is None:
