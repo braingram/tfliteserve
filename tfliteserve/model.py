@@ -131,7 +131,7 @@ class TFLiteServer(sharedmem.SharedMemoryServer):
         if loop is None:
             loop = asyncio.get_event_loop()
 
-        if self.junk_period is not None:
+        if self.junk_period is not None and self.junk_period > 0:
             print("Running junk data every %s seconds" % self.junk_period)
             loop.call_soon(self.run_junk)
 
