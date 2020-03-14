@@ -33,6 +33,8 @@ import time
 
 import numpy
 
+from . import fifo
+
 
 default_server_folder = '/dev/shm/tfliteserver'
 
@@ -129,13 +131,14 @@ class SharedMemoryBuffers:
             # load meta from directory
             with open(mfn, 'rb') as f:
                 meta = pickle.load(f)
+            self.in_fifo = fifo.writer(ir_fn)
+            self.out_fifo = fifo.reader(or_fn)
         else:
             self.is_client = False
             if not os.path.exists(self.folder):
                 os.makedirs(self.folder)
-            for fn in (ir_fn, or_fn):
-                if not os.path.exists(fn):
-                    os.mkfifo(fn)
+            self.in_fifo = fifo.reader(ir_fn, True)
+            self.out_fifo = fifo.writer(or_fn, True)
             # write meta to directory
             with open(mfn, 'wb') as f:
                 pickle.dump(meta, f)
@@ -157,30 +160,22 @@ class SharedMemoryBuffers:
             os.path.join(self.folder, 'output'),
             dtype=output_dtype, mode='w+', shape=output_shape)
         
-        if self.is_client:
-            self.output_ready_fp = open(or_fn, 'r')
-            self.input_ready_fp = open(ir_fn, 'w')
-            ffp = self.output_ready_fp
-        else:
-            self.output_ready_fp = open(or_fn, 'w')
-            self.input_ready_fp = open(ir_fn, 'r')
-            ffp = self.input_ready_fp
+        for fn in (ir_fn, or_fn):
+            print("Waiting for %s" % fn)
+            while not os.path.exists(fn):
+                time.sleep(0.1)
 
         # flush input
-        while ffp in select.select([ffp,], [], [], 0.001)[0]:
-            ffp.read(1)
+        #while ffp in select.select([ffp,], [], [], 0.001)[0]:
+        #    ffp.read(1)
+        self.connect()
 
-    def __del__(self):
-        if not self.input_ready_fp.closed:
-            try:
-                self.input_ready_fp.close()
-            except BrokenPipeError:
-                print("input_ready_fp.close() resulted in broken pipe")
-        if not self.output_ready_fp.closed:
-            try:
-                self.output_ready_fp.close()
-            except BrokenPipeError:
-                print("output_ready_fp.close() resulted in broken pipe")
+    def connect(self):
+        r = self.in_fifo.connect()
+        return self.out_fifo.connect() and r
+
+    def connected(self):
+        return self.in_fifo.connected() and self.out_fifo.connected()
 
     def _wait_for_buffers(self):
         if not os.path.exists(self.folder):
@@ -208,11 +203,12 @@ class SharedMemoryBuffers:
             Must be the same size and dtype of input_array
         """
         assert self.is_client
+        if not self.connect():
+            return False
         self.input_array[:] = values
         self.input_array.flush()
 
-        self.input_ready_fp.write("1")
-        self.input_ready_fp.flush()
+        return self.input_fifo.write()
 
     def get_input(self, copy=True):
         """Get a copy of or reference to input_array
@@ -241,11 +237,12 @@ class SharedMemoryBuffers:
             Must be the same size and dtype of output_array
         """
         assert not self.is_client
+        if not self.connect():
+            return False
         self.output_array[:] = values
         self.output_array.flush()
 
-        self.output_ready_fp.write("1")
-        self.output_ready_fp.flush()
+        return self.output_fifo.write()
 
     def get_output(self, copy=True):
         """Get a copy of or reference to output_array
@@ -283,7 +280,12 @@ class SharedMemoryServer:
             if cn not in self.clients:
                 logging.debug("Adding client: %s", cn)
                 self.add_client(cn)
-            # else:  # TODO check if client is still alive, read if not
+        for cn in self.clients:
+            c = self.clients[cn]
+            if not c.connected():
+                if c.connect():  # client ready
+                    self.loop.add_reader(
+                        c.input_fifo.fnum, self.run_client, cn)
         self.loop.call_later(
             1.0, self.check_for_new_clients)
 
@@ -292,17 +294,23 @@ class SharedMemoryServer:
             del self.clients[name]
         self.clients[name] = SharedMemoryBuffers(
             name, self.meta, server_folder=self.folder, create=True)
-        self.loop.add_reader(
-            self.clients[name].input_ready_fp, self.run_client, name)
+        # wait for client fnum to be something
+        #self.loop.add_reader(
+        #    self.clients[name].input_fifo.fnum, self.run_client, name)
 
     def run_client(self, client_name):
         b = self.clients[client_name]
-        b.input_ready_fp.read(1)
+        if not b.input_fifo.read():
+            # client failed
+            print("Client input_fifo read failed: %s" % client_name)
+            self.loop.remove_reader(self.clients[client_name].input_fifo.fnum)
+            del self.clients[client_name]
+            return
         try:
             b.set_output(self.function(b.input_array))
         except BrokenPipeError as e:
             print("Client connection failed: %s[%s]" % (client_name, e))
-            self.loop.remove_reader(self.clients[client_name].input_ready_fp)
+            self.loop.remove_reader(self.clients[client_name].input_fifo.fnum)
             del self.clients[client_name]
 
     def run_forever(self, loop=None):
@@ -322,11 +330,12 @@ class SharedMemoryClient:
         self.buffers = SharedMemoryBuffers(
             name, server_folder=server_folder, create=False)
 
-    def run(self, input_array, timeout=None, delay=None):
+    def run(self, input_array, timeout=None):
         self.buffers.set_input(input_array)
 
-        # TODO better integrate this with the buffers
-        self.buffers.output_ready_fp.read(1)
+        # wait for output ready signal
+        self.buffers.output_fifo.read(block=True, teimout=timeout)
+
         return self.buffers.get_output(copy=True)
 
     def __call__(self, *args, **kwargs):
