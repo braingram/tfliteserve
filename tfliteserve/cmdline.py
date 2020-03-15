@@ -1,5 +1,6 @@
 import argparse
 
+from . import fifo
 from . import model
 from . import sharedmem
 
@@ -21,7 +22,18 @@ def run_server():
     parser.add_argument(
         '-m', '--model', default='',
         help='Model directory or file')
+    parser.add_argument(
+        '-t', '--test', default=False, action='store_true',
+        help='run tests')
     args = parser.parse_args()
+    if args.test:
+        print("Running fifo tests")
+        fifo.test()
+        print("\tok")
+        print("Running sharedmem tests")
+        sharedmem.test()
+        print("\tok")
+        return
     if args.fake:
         meta = {
             'input': {'shape': (1, 224, 224, 3), 'dtype': 'uint8'},

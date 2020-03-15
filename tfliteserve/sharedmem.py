@@ -454,14 +454,12 @@ def test(verbose=False):
     assert st.thread.is_alive(), "Server failed to start"
 
     for i in range(2):
-        print("--- testing client connection %s ---" % i)
         c = SharedMemoryClient('test')
         assert c.wait_for_server(1.0), "Server never connected"
         r = c.run(make_input(10), timeout=1.0).mean()
         assert abs(r - 10) < 1E-4, "Input/Output[%i] fail: %s != 10" % (i, r)
         del c
 
-    print("--- Testing dead server ---")
     c = SharedMemoryClient('test')
     st.kill()
     assert not st.thread.is_alive(), "Server failed to die"
@@ -471,11 +469,9 @@ def test(verbose=False):
         c.run(make_input(10), timeout=0.1)
         ok = False
     except Exception as e:
-        print("Server failed successfully with %s" % e)
         ok = True
     assert ok, "Server disconnnect didn't fail"
 
-    print("--- Testing server reconnect ---")
     st = ServerThread()
     assert st.thread.is_alive(), "Server failed to restart"
 
