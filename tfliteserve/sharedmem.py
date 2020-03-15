@@ -55,6 +55,10 @@ def validate_meta(meta):
                 raise ValueError("Invalid metadata missing %s %s" % (k, sk))
 
 
+class SharedMemoryException(Exception):
+    pass
+
+
 class SharedMemoryBuffers:
     """
     Construct shared buffers (or access existing ones) in a folder on disk.
@@ -303,6 +307,8 @@ class SharedMemoryServer:
         if not os.path.exists(self.folder):
             os.makedirs(self.folder)
         self.clients = {}
+        self.check_for_new_clients_period = 0.5
+        self.run_client_timeout = 1.0
         validate_meta(meta)
         self.meta = meta
 
@@ -312,9 +318,9 @@ class SharedMemoryServer:
                 self.add_client(cn)
         for cn in self.clients:
             self.add_reader(cn)  # only adds if needed
-        # TODO add configurable check period
         self.loop.call_later(
-            0.5, self.check_for_new_clients)
+            self.check_for_new_clients_period,
+            self.check_for_new_clients)
 
     def remove_client(self, name):
         if name not in self.clients:
@@ -349,8 +355,7 @@ class SharedMemoryServer:
     def run_client(self, client_name):
         logging.debug("Running client: %s", client_name)
         b = self.clients[client_name]
-        # TODO add configurable timeout
-        if not b.in_fifo.read(block=True, timeout=1.0):
+        if not b.in_fifo.read(block=True, timeout=self.run_client_timeout):
             # client failed
             logging.info("Client in_fifo read failed: %s", client_name)
             self.remove_client(client_name)
@@ -385,13 +390,11 @@ class SharedMemoryClient:
 
     def run(self, input_array, timeout=None):
         if not self.buffers.set_input(input_array):
-            # TODO make this a custom exception
-            raise Exception("Input could not be set")
+            raise SharedMemoryException("Input could not be set")
 
         # wait for output ready signal
         if not self.buffers.out_fifo.read(block=True, timeout=timeout):
-            # TODO make this a custom exception
-            raise Exception("Server communication failed")
+            raise SharedMemoryException("Server communication failed")
 
         return self.buffers.get_output(copy=True)
 
@@ -399,8 +402,9 @@ class SharedMemoryClient:
         return self.run(*args, **kwargs)
 
 
-def test():
-    logging.basicConfig(level=logging.DEBUG)
+def test(verbose=False):
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG)
     meta = {
         'input': {
             'shape': (1, 224, 224, 3),
