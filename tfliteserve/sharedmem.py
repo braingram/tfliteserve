@@ -29,6 +29,7 @@ import os
 import pickle
 import select
 import shutil
+import threading
 import time
 
 import numpy
@@ -120,6 +121,9 @@ class SharedMemoryBuffers:
         else:
             self._wait_for_buffers()
 
+    def __repr__(self):
+        return "SharedMemoryBuffers(%s,%s)" % (hex(id(self)), self.is_client)
+
     def _create_buffers(self, meta=None):
         mfn = os.path.join(self.folder, 'meta')
 
@@ -149,30 +153,57 @@ class SharedMemoryBuffers:
         input_shape = tuple(meta['input']['shape'])
         input_dtype = numpy.dtype(meta['input']['dtype'])
 
+        #mode = 'w+' if self.is_client else 'r+'
+        ifn = os.path.join(self.folder, 'input')
+        mode = 'r+' if os.path.exists(ifn) else 'w+'
+        #if not os.path.exists(ifn):
+        #    mode = 'w+'
         self.input_array = numpy.memmap(
-            os.path.join(self.folder, 'input'),
-            dtype=input_dtype, mode='w+', shape=input_shape)
+            ifn, dtype=input_dtype, mode=mode, shape=input_shape)
 
         output_shape = tuple(meta['output']['shape'])
         output_dtype = numpy.dtype(meta['output']['dtype'])
 
+        #mode = 'r+' if self.is_client else 'w+'
+        ofn = os.path.join(self.folder, 'output')
+        mode = 'r+' if os.path.exists(ofn) else 'w+'
         self.output_array = numpy.memmap(
-            os.path.join(self.folder, 'output'),
-            dtype=output_dtype, mode='w+', shape=output_shape)
+            ofn, dtype=output_dtype, mode=mode, shape=output_shape)
         
-        for fn in (ir_fn, or_fn):
-            print("Waiting for %s" % fn)
+        for fn in (ir_fn, or_fn, ifn, ofn, mfn):
+            logging.debug("%s waiting for %s", self, fn)
             while not os.path.exists(fn):
-                time.sleep(0.1)
+                time.sleep(0.001)
 
         # flush input
         #while ffp in select.select([ffp,], [], [], 0.001)[0]:
         #    ffp.read(1)
+
         self.connect()
 
-    def connect(self):
-        r = self.in_fifo.connect()
-        return self.out_fifo.connect() and r
+        # flush
+        #if self.is_client:
+        #    while self.in_fifo.read():
+        #        pass
+        #else:
+        #    while self.out_fifo.read():
+        #        pass
+
+    def connect(self, timeout=None):
+        if timeout is None:
+            r = self.in_fifo.connect()
+            return self.out_fifo.connect() and r
+        t = time.monotonic()
+        while (time.monotonic() - t) <= timeout:
+            if self.connect():
+                return True
+        return False
+        #if self.is_client is False:
+        #    r = self.in_fifo.connect()
+        #    return self.out_fifo.connect() and r
+        #else:
+        #    r = self.out_fifo.connect()
+        #    return self.in_fifo.connect() and r
 
     def connected(self):
         return self.in_fifo.connected() and self.out_fifo.connected()
@@ -189,7 +220,7 @@ class SharedMemoryBuffers:
                 'output_ready']
         ]
         for fn in fns:
-            logging.debug("Waiting for %s", fn)
+            logging.debug("%s waiting for %s", self, fn)
             while not os.path.exists(fn):
                 time.sleep(0.001)
         self._create_buffers()
@@ -208,7 +239,7 @@ class SharedMemoryBuffers:
         self.input_array[:] = values
         self.input_array.flush()
 
-        return self.input_fifo.write()
+        return self.in_fifo.write()
 
     def get_input(self, copy=True):
         """Get a copy of or reference to input_array
@@ -242,7 +273,7 @@ class SharedMemoryBuffers:
         self.output_array[:] = values
         self.output_array.flush()
 
-        return self.output_fifo.write()
+        return self.out_fifo.write()
 
     def get_output(self, copy=True):
         """Get a copy of or reference to output_array
@@ -278,40 +309,57 @@ class SharedMemoryServer:
     def check_for_new_clients(self):
         for cn in os.listdir(self.folder):
             if cn not in self.clients:
-                logging.debug("Adding client: %s", cn)
                 self.add_client(cn)
         for cn in self.clients:
-            c = self.clients[cn]
-            if not c.connected():
-                if c.connect():  # client ready
-                    self.loop.add_reader(
-                        c.input_fifo.fnum, self.run_client, cn)
+            self.add_reader(cn)  # only adds if needed
+        # TODO add configurable check period
         self.loop.call_later(
-            1.0, self.check_for_new_clients)
+            0.5, self.check_for_new_clients)
+
+    def remove_client(self, name):
+        if name not in self.clients:
+            return
+        logging.debug("Removing client: %s", name)
+        if self.clients[name].has_reader:
+            self.loop.remove_reader(self.clients[name].in_fifo.fnum)
+            self.clients[name].has_reader = False
+        del self.clients[name]
+
+    def add_reader(self, name):
+        c = self.clients[name]
+        if c.has_reader:
+            return False
+        if not c.connect():
+            return False
+        logging.debug("Adding reader for %s", name)
+        self.loop.add_reader(
+            c.in_fifo.fnum, self.run_client, name)
+        c.has_reader = True
 
     def add_client(self, name):
         if name in self.clients:
-            del self.clients[name]
-        self.clients[name] = SharedMemoryBuffers(
+            self.remove_client(name)
+        logging.debug("Adding client: %s", name)
+        c = SharedMemoryBuffers(
             name, self.meta, server_folder=self.folder, create=True)
-        # wait for client fnum to be something
-        #self.loop.add_reader(
-        #    self.clients[name].input_fifo.fnum, self.run_client, name)
+        c.has_reader = False
+        self.clients[name] = c
+        self.add_reader(name)
 
     def run_client(self, client_name):
+        logging.debug("Running client: %s", client_name)
         b = self.clients[client_name]
-        if not b.input_fifo.read():
+        # TODO add configurable timeout
+        if not b.in_fifo.read(block=True, timeout=1.0):
             # client failed
-            print("Client input_fifo read failed: %s" % client_name)
-            self.loop.remove_reader(self.clients[client_name].input_fifo.fnum)
-            del self.clients[client_name]
+            logging.info("Client in_fifo read failed: %s", client_name)
+            self.remove_client(client_name)
             return
         try:
             b.set_output(self.function(b.input_array))
         except BrokenPipeError as e:
-            print("Client connection failed: %s[%s]" % (client_name, e))
-            self.loop.remove_reader(self.clients[client_name].input_fifo.fnum)
-            del self.clients[client_name]
+            logging.info("Client connection failed: %s[%s]", client_name, e)
+            self.remove_client(client_name)
 
     def run_forever(self, loop=None):
         if loop is None:
@@ -325,18 +373,110 @@ class SharedMemoryServer:
 
 
 class SharedMemoryClient:
-    def __init__(self, name, server_folder=None):
+    def __init__(self, name, server_folder=None, wait=True):
         self.name = name
         self.buffers = SharedMemoryBuffers(
             name, server_folder=server_folder, create=False)
+        if wait:
+            self.wait_for_server()
+
+    def wait_for_server(self, timeout=None):
+        return self.buffers.connect(timeout)
 
     def run(self, input_array, timeout=None):
-        self.buffers.set_input(input_array)
+        if not self.buffers.set_input(input_array):
+            # TODO make this a custom exception
+            raise Exception("Input could not be set")
 
         # wait for output ready signal
-        self.buffers.output_fifo.read(block=True, teimout=timeout)
+        if not self.buffers.out_fifo.read(block=True, timeout=timeout):
+            # TODO make this a custom exception
+            raise Exception("Server communication failed")
 
         return self.buffers.get_output(copy=True)
 
     def __call__(self, *args, **kwargs):
         return self.run(*args, **kwargs)
+
+
+def test():
+    logging.basicConfig(level=logging.DEBUG)
+    meta = {
+        'input': {
+            'shape': (1, 224, 224, 3),
+            'dtype': 'uint8',
+        },
+        'output': {
+            'shape': (1, 1024),
+            'dtype': 'f8',
+        },
+    }
+
+    def make_input(v=None):
+        if v is None:
+            return numpy.random.randint(
+                0, 255,
+                size=meta['input']['shape'], dtype=meta['input']['dtype'])
+        else:
+            return numpy.ones(
+                meta['input']['shape'], dtype=meta['input']['dtype']) * v
+
+    def f(i):
+        o = numpy.zeros(
+            meta['output']['shape'], dtype=meta['output']['dtype'])
+        o[:] = i.mean()
+        return o
+
+    class ServerThread:
+        def __init__(self):
+            self.thread = threading.Thread(
+                target=self.run_server, daemon=True)
+            self.thread.start()
+        
+        def run_server(self):
+            self.server = SharedMemoryServer(f, meta)
+            #self.loop = asyncio.get_event_loop()
+            self.loop = asyncio.new_event_loop()
+            self.server.run_forever(loop=self.loop)
+
+        def _stop_loop(self):
+            self.loop.stop()
+
+        def kill(self):
+            self.loop.call_soon_threadsafe(self._stop_loop)
+            self.thread.join()
+
+    st = ServerThread()
+    assert st.thread.is_alive(), "Server failed to start"
+
+    for i in range(2):
+        print("--- testing client connection %s ---" % i)
+        c = SharedMemoryClient('test')
+        assert c.wait_for_server(1.0), "Server never connected"
+        r = c.run(make_input(10), timeout=1.0).mean()
+        assert abs(r - 10) < 1E-4, "Input/Output[%i] fail: %s != 10" % (i, r)
+        del c
+
+    print("--- Testing dead server ---")
+    c = SharedMemoryClient('test')
+    st.kill()
+    assert not st.thread.is_alive(), "Server failed to die"
+
+    ok = False
+    try:
+        c.run(make_input(10), timeout=0.1)
+        ok = False
+    except Exception as e:
+        print("Server failed successfully with %s" % e)
+        ok = True
+    assert ok, "Server disconnnect didn't fail"
+
+    print("--- Testing server reconnect ---")
+    st = ServerThread()
+    assert st.thread.is_alive(), "Server failed to restart"
+
+    assert c.wait_for_server(1.0), "Server never connected"
+    r = c.run(make_input(10), timeout=1.0).mean()
+    assert abs(r - 10) < 1E-4, "Input/Output[%i] fail: %s != 10" % (i, r)
+
+    st.kill()

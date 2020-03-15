@@ -20,6 +20,8 @@ class FifoWatcher:
         if create:
             if not os.path.exists(self.fn):
                 os.mkfifo(self.fn)
+            while not os.path.exists(self.fn):
+                time.sleep(0.001)
         self.fnum = None
         self.poller = select.epoll()
         self.connect()
@@ -27,13 +29,16 @@ class FifoWatcher:
     def __del__(self):
         self.disconnect()
 
+    def __repr__(self):
+        return "FifoWatcher(%s,%s,%s)" % (hex(id(self)), self.fn, self.fnum)
+
     def disconnect(self):
         if self.fnum is not None:
             try:
                 os.close(self.fnum)
                 self.poller.unregister(self.fnum)
             except BrokenPipeError as e:
-                logging.info("closing %s resulted in %s", self.fn, e)
+                logging.info("closing %s resulted in %s", self, e)
         self.fnum = None
 
     def connected(self):
@@ -61,11 +66,15 @@ class FifoWatcher:
     def read(self, block=False, timeout=-1):
         if not self.connected():
             if not self.connect():
+                logging.info("read failure: %s failed to connect", self)
                 return False
+
         if block:
+            if timeout is None:
+                timeout = -1
             events = self.poller.poll(timeout=timeout)
             if len(events) == 0:
-                logging.info("Read timed out")
+                logging.info("read failure: %s timed out", self)
                 return False
             readable = False
             for evt in events:
@@ -78,18 +87,22 @@ class FifoWatcher:
                     readable = True
                     break
             if not readable:
-                logging.info("Fifo not readable")
+                logging.info("read failure: %s fifo not readable", self)
                 return False
+
         try:
             r = os.read(self.fnum, 1)
             return len(r) == 1
+        except OSError as e:  # bad file descriptor: retry?
+            logging.info("read failure: %s failed with %s", self, e)
+            return False
         except BrokenPipeError as e:
-            logging.info("Reading from %s failed with %s", self.fn, e)
+            logging.info("read failure: %s failed with %s", self, e)
             self.disconnect()
             return False
         except BlockingIOError as e:
             # fifo is in non-blocking mode and no data available
-            logging.info("Reading from %s failed with %s", self.fn, e)
+            logging.info("read failure: %s failed with %s", self, e)
             return False
 
     def write(self):
@@ -98,9 +111,10 @@ class FifoWatcher:
                 return False
         try:
             os.write(self.fnum, b"1")
+            logging.debug("%s wrote", self)
             # fp.flush()  # TODO how to flush?
         except BrokenPipeError as e:
-            logging.info("Writing to %s failed with %s", self.fn, e)
+            logging.info("write failure: %s failed with %s", self, e)
             self.disconnect()
             return False
         return True
@@ -114,7 +128,7 @@ def reader(fn, create=False):
     return FifoWatcher(fn, os.O_RDONLY | os.O_NONBLOCK, create=create)
 
 
-def test_fifo_watcher():
+def test():
     tfn = tempfile.mktemp()
     atexit.register(lambda: os.remove(tfn))
 
@@ -130,7 +144,7 @@ def test_fifo_watcher():
     test_write(s, c)
 
     # test blocking read/write
-    t = threading.Thread(target=lambda: c.read(block=True))
+    t = threading.Thread(target=lambda: c.read(block=True), daemon=True)
     t.start()
     assert t.is_alive(), "Client read thread failed to start"
     time.sleep(0.1)
@@ -149,3 +163,5 @@ def test_fifo_watcher():
     # test server removal
     del s
     assert not c.read(), "Client read with no server did not fail"
+
+    # test in asyncio event loop
