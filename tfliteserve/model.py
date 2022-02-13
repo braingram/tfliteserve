@@ -59,6 +59,7 @@ class TFLiteModel:
         self.q_out_scale, self.q_out_zero = self.output_details['quantization']
 
         self.meta = {
+            'type': 'classifier',
             'input': self.input_details,
             'output': self.output_details,
             'labels': self.labels,
@@ -78,11 +79,9 @@ class TFLiteModel:
         self.model.set_tensor(self.input_tensor_index, input_tensor)
 
     def get_output(self):
-        return (
-            self.q_out_scale *
-            (
-                numpy.squeeze(self.model.get_tensor(self.output_tensor_index)) -
-                self.q_out_zero))
+        t = self.model.get_tensor(self.output_tensor_index)
+        # print(t)
+        return (self.q_out_scale * (numpy.squeeze(t) - self.q_out_zero))
 
     def run(self, input_tensor):
         self.set_input(input_tensor)
@@ -103,6 +102,50 @@ class TFLiteModel:
 
     def __call__(self, *args, **kwargs):
         return self.run(*args, **kwargs)
+
+
+class Classifier(TFLiteModel):
+    pass
+
+
+class Detector(TFLiteModel):
+    def __init__(self, model_fn, labels_fn=None, edge=False):
+        super().__init__(model_fn, labels_fn, edge)
+
+        self.output_details = self.model.get_output_details()
+
+        # outputs are:
+        # - scores
+        # - bboxes [top, left, bottom, right] normalized 0-1
+        # - n_boxes (shape 1)
+        # - classes
+        assert len(self.output_details) == 4
+
+        # make fake output with shape (n_boxes, 6)
+        # 6 = [class, score, top, left, bottom, right]
+        self.n_boxes = self.output_details[0]['shape'][1]
+
+        # validate output shape
+        assert tuple(self.output_details[0]['shape']) == (1, self.n_boxes)
+        assert tuple(self.output_details[1]['shape']) == (1, self.n_boxes, 4)
+        assert tuple(self.output_details[2]['shape']) == (1,)
+        assert tuple(self.output_details[3]['shape']) == (1, self.n_boxes)
+
+        self.meta['output'] = {
+            'shape': (self.n_boxes, 6),
+            'dtype': 'f8',
+        }
+        self.meta['type'] = 'detector'
+        self.meta['n_boxes'] = self.n_boxes
+
+    def get_output(self):
+        scores, bboxes, _, classes = [
+            numpy.squeeze(self.model.get_tensor(td['index'])) for td in self.output_details]
+        # print(scores, bboxes, classes)
+        return numpy.hstack((
+            classes[:, numpy.newaxis],
+            scores[:, numpy.newaxis],
+            bboxes))
 
 
 class TFLiteServer(sharedmem.SharedMemoryServer):

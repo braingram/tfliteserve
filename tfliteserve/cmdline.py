@@ -25,6 +25,10 @@ def run_server():
     parser.add_argument(
         '-t', '--test', default=False, action='store_true',
         help='run tests')
+    parser.add_argument(
+        '-T', '--type', default='classifier',
+        choices=('classifier', 'detector'),
+        help='model type')
     args = parser.parse_args()
     if args.test:
         print("Running fifo tests")
@@ -35,6 +39,8 @@ def run_server():
         print("\tok")
         return
     if args.fake:
+        if args.type != 'classifier':
+            raise Exception("Only able to fake classifier")
         meta = {
             'input': {'shape': (1, 224, 224, 3), 'dtype': 'uint8'},
             'output': {'shape': (1, 1024), 'dtype': 'f8'},
@@ -48,7 +54,12 @@ def run_server():
 
         s = sharedmem.SharedMemoryServer(f, meta)
     else:
-        m = model.TFLiteModel(args.model, args.labels, edge=args.edge)
+        if args.type == 'classifier':
+            m = model.Classifier(args.model, args.labels, edge=args.edge)
+        elif args.type == 'detector':
+            m = model.Detector(args.model, args.labels, edge=args.edge)
+        else:
+            raise Exception("Unknown type %s" % (args.type, ))
         junk = None if args.junk == 0.0 else args.junk
         s = model.TFLiteServer(m, junk_period=junk)
     s.run_forever()
